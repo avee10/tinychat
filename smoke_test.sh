@@ -30,7 +30,7 @@ EVAL_TOKENS=$((SEQ_LEN * DEV_BS * 32))          # ~8k tokens for quick bpb/eval 
 
 # ---------- environment & deps ----------
 export OMP_NUM_THREADS=1
-export TINYCHAT_BASE_DIR="${TINYCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+export TINYCHAT_BASE_DIR="${TINYCHAT_BASE_DIR:-$HOME/.cache/tinychat}"
 mkdir -p "$TINYCHAT_BASE_DIR"
 
 # venv via uv (fast)
@@ -61,16 +61,23 @@ fi
 
 # download only 1 shard and train a tiny tokenizer on ~200k chars
 python -m nanochat.dataset -n 1
+
+# >>> IMPORTANT: stage the single shard into train/ and val/ BEFORE tok_train/eval
 DATA_ROOT="${TINYCHAT_BASE_DIR}/base_data"
 mkdir -p "${DATA_ROOT}/train" "${DATA_ROOT}/val"
-# If the downloader put shards directly under base_data/, mirror one into both splits
+# If shard(s) are at base_data/*.parquet, mirror one into both splits
 if ls "${DATA_ROOT}"/*.parquet >/dev/null 2>&1; then
   for f in "${DATA_ROOT}"/*.parquet; do
-    # avoid duplicating if we rerun the smoke test
     [ -f "${DATA_ROOT}/train/$(basename "$f")" ] || cp "$f" "${DATA_ROOT}/train/"
     [ -f "${DATA_ROOT}/val/$(basename "$f")" ]   || cp "$f" "${DATA_ROOT}/val/"
   done
 fi
+
+# Quick sanity: ensure at least one file is visible to the split readers
+echo "[debug] train shards:"; ls -lh "${DATA_ROOT}/train" || true
+echo "[debug] val shards:";   ls -lh "${DATA_ROOT}/val"   || true
+
+
 python -m scripts.tok_train --max_chars=200000
 if ls "${DATA_ROOT}/train"/*.parquet >/dev/null 2>&1; then
   python -m scripts.tok_eval
