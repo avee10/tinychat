@@ -30,9 +30,9 @@ EVAL_TOKENS=$((SEQ_LEN * DEV_BS * 32))          # ~8k tokens for quick bpb/eval 
 
 # ---------- environment & deps ----------
 export OMP_NUM_THREADS=1
-export TINYCHAT_BASE_DIR="${TINYCHAT_BASE_DIR:-$HOME/.cache/tinychat}"
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$TINYCHAT_BASE_DIR}"
-mkdir -p "$TINYCHAT_BASE_DIR"
+export TINYCHAT_BASE_DIR="$HOME/.cache/tinychat"
+export NANOCHAT_BASE_DIR="$TINYCHAT_BASE_DIR"   # nanochat reads this one
+mkdir -p "$NANOCHAT_BASE_DIR"
 
 # venv via uv (fast)
 command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -70,7 +70,7 @@ fi
 python -m nanochat.dataset -n 1
 
 # >>> IMPORTANT: stage the single shard into train/ and val/ BEFORE tok_train/eval
-DATA_ROOT="${TINYCHAT_BASE_DIR}/base_data"
+DATA_ROOT="${NANOCHAT_BASE_DIR}/base_data"
 mkdir -p "${DATA_ROOT}/train" "${DATA_ROOT}/val"
 # If shard(s) are at base_data/*.parquet, mirror one into both splits
 if ls "${DATA_ROOT}"/*.parquet >/dev/null 2>&1; then
