@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Minimal-cost sanity run for nanochat:
+# Minimal-cost sanity run for tinychat:
 # - trains a tiny tokenizer on ~0.2M chars
 # - base-trains a TINY model for a handful of steps
 # - mid-trains & SFT for a handful of steps
@@ -30,8 +30,8 @@ EVAL_TOKENS=$((SEQ_LEN * DEV_BS * 32))          # ~8k tokens for quick bpb/eval 
 
 # ---------- environment & deps ----------
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
-mkdir -p "$NANOCHAT_BASE_DIR"
+export TINYCHAT_BASE_DIR="${TINYCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+mkdir -p "$TINYCHAT_BASE_DIR"
 
 # venv via uv (fast)
 command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -52,32 +52,50 @@ python -m nanochat.report reset
 # ---------- tokenizer (tiny) ----------
 # Rust BPE build (noop if already built)
 if ! command -v maturin &>/dev/null; then uv tool install maturin; fi
-if [ ! -f "rustbpe/target/release/librustbpe"* ]; then
+# Build the rustbpe Tokenizer (only if no build artifacts exist)
+if compgen -G "rustbpe/target/release/*rustbpe*" > /dev/null; then
+  echo "[info] rustbpe already built."
+else
   uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 fi
 
 # download only 1 shard and train a tiny tokenizer on ~200k chars
 python -m nanochat.dataset -n 1
+DATA_ROOT="${TINYCHAT_BASE_DIR}/base_data"
+mkdir -p "${DATA_ROOT}/train" "${DATA_ROOT}/val"
+# If the downloader put shards directly under base_data/, mirror one into both splits
+if ls "${DATA_ROOT}"/*.parquet >/dev/null 2>&1; then
+  for f in "${DATA_ROOT}"/*.parquet; do
+    # avoid duplicating if we rerun the smoke test
+    [ -f "${DATA_ROOT}/train/$(basename "$f")" ] || cp "$f" "${DATA_ROOT}/train/"
+    [ -f "${DATA_ROOT}/val/$(basename "$f")" ]   || cp "$f" "${DATA_ROOT}/val/"
+  done
+fi
 python -m scripts.tok_train --max_chars=200000
-python -m scripts.tok_eval
+if ls "${DATA_ROOT}/train"/*.parquet >/dev/null 2>&1; then
+  python -m scripts.tok_eval
+else
+  echo "[warn] No train shards visible to tok_eval; skipping tokenizer eval."
+fi
+
 
 # ---------- base (tiny) ----------
 # eval bundle (for core metric if enabled; we’ll keep core metric off to save time)
 EVAL_BUNDLE_URL=https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip
-if [ ! -d "$NANOCHAT_BASE_DIR/eval_bundle" ]; then
+if [ ! -d "$TINYCHAT_BASE_DIR/eval_bundle" ]; then
   curl -L -o eval_bundle.zip "$EVAL_BUNDLE_URL"
   unzip -q eval_bundle.zip && rm -f eval_bundle.zip
-  mv eval_bundle "$NANOCHAT_BASE_DIR"
+  mv eval_bundle "$TINYCHAT_BASE_DIR"
 fi
 
 # Optional HF mixture file (if using HF for base)
 if [[ "${USE_HF_BASE}" == "1" ]]; then
-  cat >"$NANOCHAT_BASE_DIR/base_mixture_smoke.yaml" <<'YAML'
+  cat >"$TINYCHAT_BASE_DIR/base_mixture_smoke.yaml" <<'YAML'
 mixture:
   - {name: "aveekmukherjee/wikivoyage-eu-india-sections", weight: 0.5, text_key: text, preproc: section_header}
   - {name: "aveekmukherjee/wikipedia-travel-eu-india",    weight: 0.5, text_key: text, preproc: section_header}
 YAML
-  BASE_FLAGS="--use_hf --hf_mixture $NANOCHAT_BASE_DIR/base_mixture_smoke.yaml"
+  BASE_FLAGS="--use_hf --hf_mixture $TINYCHAT_BASE_DIR/base_mixture_smoke.yaml"
 else
   BASE_FLAGS=""
 fi
@@ -104,16 +122,16 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_loss -- \
 # ---------- mid (tiny) ----------
 # If not using HF, the stock script wants identity_conversations.jsonl
 if [[ "${USE_HF_MID}" != "1" ]]; then
-  curl -L -o "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" \
+  curl -L -o "$TINYCHAT_BASE_DIR/identity_conversations.jsonl" \
     https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
   MID_FLAGS=""
 else
-  cat >"$NANOCHAT_BASE_DIR/mid_mixture_smoke.yaml" <<'YAML'
+  cat >"$TINYCHAT_BASE_DIR/mid_mixture_smoke.yaml" <<'YAML'
 mixture:
   - {name: "aveekmukherjee/wikivoyage-eu-india-sections", weight: 0.7, text_key: text, preproc: section_header}
   - {name: "aveekmukherjee/wikipedia-travel-eu-india",    weight: 0.3, text_key: text, preproc: section_header}
 YAML
-  MID_FLAGS="--use_hf --hf_mixture $NANOCHAT_BASE_DIR/mid_mixture_smoke.yaml"
+  MID_FLAGS="--use_hf --hf_mixture $TINYCHAT_BASE_DIR/mid_mixture_smoke.yaml"
 fi
 
 torchrun --standalone --nproc_per_node=1 -m scripts.mid_train -- \
