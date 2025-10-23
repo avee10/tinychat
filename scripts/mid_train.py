@@ -9,6 +9,16 @@ Or torchrun for training:
 torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_size=16
 """
 
+try:
+    from datasets import load_dataset
+except Exception:
+    load_dataset = None
+
+import yaml
+import random
+from dataclasses import dataclass
+from typing import Iterator, List, Optional
+
 from collections import deque
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -28,6 +38,135 @@ from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
+
+
+# --- NEW flags for optional HF streaming mid-data ---
+use_hf = False                  # set True to use HF streaming instead of TaskMixture
+hf_mixture = "mid_mixture.yaml"                 # YAML string or path describing the HF dataset mixture
+hf_seed = 42                    # sampling seed (offset per ddp_rank)
+
+@dataclass
+class MixSpec:
+    name: str
+    weight: float
+    split: str = "train"
+    text_key: str = "text"     # or "auto" for mid buckets
+    preproc: Optional[str] = None
+
+def _parse_hf_mixture(arg: str) -> List[MixSpec]:
+    if not arg:
+        return []
+    if os.path.exists(arg):
+        obj = yaml.safe_load(open(arg))
+        items = obj.get("mixture", obj)
+    else:
+        obj = yaml.safe_load(arg)
+        items = obj.get("mixture", obj)
+    out = []
+    for it in items:
+        out.append(MixSpec(
+            name=it["name"],
+            weight=float(it.get("weight", 1.0)),
+            split=it.get("split", "train"),
+            text_key=it.get("text_key", "text"),
+            preproc=it.get("preproc")
+        ))
+    return out
+
+def _section_header(ex):
+    h = ex.get("section_title")
+    t = ex.get("text", "")
+    if h and isinstance(h, str) and h.strip():
+        return f"== {h} ==\n{t}"
+    return t
+
+def _mid_auto_text(ex):
+    # serialize mid buckets into compact plain text
+    task = ex.get("task")
+    if task == "bulletize":
+        tgt = ex.get("target") or []
+        if not isinstance(tgt, list):
+            tgt = [tgt]
+        bullets = "• " + "\n• ".join([str(x) for x in tgt[:4]])
+        src = ex.get("source") or {}
+        title = src.get("title", "")
+        url = src.get("url", "")
+        hdr = (title + "\n") if title else ""
+        cite = f"\n[{url}]" if url else ""
+        return hdr + bullets + cite
+    if task == "qa_grounded":
+        ans = ex.get("answer", "")
+        cites = ex.get("citations") or []
+        cite = f" [{cites[0]}]" if cites else ""
+        return str(ans) + cite
+    if task in ("tz_math","date_range","distance_km"):
+        return f"{task} | {ex.get('input')} -> {ex.get('target')}"
+    return ex.get("text")
+
+def _encode_with_nanochat(tokenizer, text: str) -> List[int]:
+    # tokenizer in nanochat is usually callable; fall back to .encode
+    try:
+        ids = tokenizer(text)
+    except TypeError:
+        ids = tokenizer.encode(text)
+    if torch.is_tensor(ids):
+        ids = ids.tolist()
+    return list(ids)
+
+def _hf_text_stream(specs: List[MixSpec], seed: int, ddp_rank: int) -> Iterator[str]:
+    assert load_dataset is not None, "pip install datasets"
+    rnd = random.Random(seed + ddp_rank)
+    buckets = []
+    for s in specs:
+        ds = load_dataset(s.name, split=s.split, streaming=True)
+        buckets.append((s, iter(ds)))
+    weights = [s.weight for s,_ in buckets]
+    probs = [w/sum(weights) for w in weights]
+
+    while True:
+        i = rnd.choices(range(len(buckets)), weights=probs, k=1)[0]
+        spec, it = buckets[i]
+        ex = next(it, None)
+        if ex is None:
+            # refresh the iterator for finite streams
+            buckets[i] = (spec, iter(load_dataset(spec.name, split=spec.split, streaming=True)))
+            continue
+        s = _mid_auto_text(ex) if spec.text_key == "auto" else ex.get(spec.text_key)
+        if not s:
+            continue
+        if spec.preproc == "section_header":
+            ex2 = dict(ex); ex2["text"] = s
+            s = _section_header(ex2)
+        yield str(s).strip()
+
+def _hf_pack_generator(tokenizer, specs: List[MixSpec], device, device_batch_size: int, max_seq_len: int, seed: int, ddp_rank: int):
+    """
+    Yields (inputs, targets) as 2D tensors like your current loader:
+      inputs: int32  (B, T)
+      targets: int64 (B, T)
+    """
+    text_iter = _hf_text_stream(specs, seed=seed, ddp_rank=ddp_rank)
+    buf: List[int] = []
+    batch_x, batch_y = [], []
+    eos_id = getattr(tokenizer, "eos_id", None)
+
+    while True:
+        txt = next(text_iter)
+        ids = _encode_with_nanochat(tokenizer, txt)
+        if eos_id is not None:
+            ids = ids + [eos_id]
+        buf.extend(ids)
+
+        while len(buf) >= max_seq_len + 1:
+            x = torch.tensor(buf[:max_seq_len], dtype=torch.long)
+            y = torch.tensor(buf[1:max_seq_len+1], dtype=torch.long)
+            buf = buf[max_seq_len:]
+            batch_x.append(x); batch_y.append(y)
+            if len(batch_x) == device_batch_size:
+                inputs = torch.stack(batch_x).to(device=device, dtype=torch.int32,  non_blocking=True)
+                targets = torch.stack(batch_y).to(device=device, dtype=torch.int64, non_blocking=True)
+                batch_x, batch_y = [], []
+                yield inputs, targets
 
 # -----------------------------------------------------------------------------
 run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
@@ -92,67 +231,92 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
 
 # Midtraining data mixture and DataLoader
+# Midtraining data mixture and DataLoader
 base_dir = get_base_dir()
-identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
-train_dataset = TaskMixture([
-    SmolTalk(split="train"), # 460K rows of general conversations
-    MMLU(subset="auxiliary_train", split="train"), # 100K rows of multiple choice problems drawn from ARC, MC_TEST, OBQA, RACE
-    GSM8K(subset="main", split="train"), # 8K rows teaching simple math and (calculator) tool use
-    CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
-    CustomJSON(filepath=identity_conversations_filepath), # let's do 2 epochs of these
-]) # total: 460K + 100K + 8K = 568K rows
-val_dataset = TaskMixture([
-    SmolTalk(split="test"), # 24K rows in test set
-    MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
-    GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 14K + 1.32K ~= 39K rows
-# DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
-# A big problem is that we don't know the final num_iterations in advance. So we create
-# these two global variables and update them from within the data generator.
-last_step = False # we will toggle this to True when we reach the end of the dataset
-approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
-def mid_data_generator(split):
-    global last_step, approx_progress
-    assert split in {"train", "val"}, "split must be 'train' or 'val'"
-    dataset = train_dataset if split == "train" else val_dataset
-    dataset_size = len(dataset)
-    assert dataset_size > 0
-    needed_tokens = device_batch_size * max_seq_len + 1 # to form one training batch of inputs,targets
-    token_buffer = deque()
-    scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
-    cursor = ddp_rank # increments by ddp_world_size each time, so each rank processes unique documents
-    it = 0 # iteration counter
-    while True:
-        # Accumulate enough tokens for one iteration before yielding
-        while len(token_buffer) < needed_tokens:
-            conversation = dataset[cursor]
-            ids, _ = tokenizer.render_conversation(conversation)
-            token_buffer.extend(ids)
-            cursor += ddp_world_size
-            if cursor >= dataset_size:
-                cursor -= dataset_size # wrap around for another epoch
-                if split == "train":
-                    last_step = True # toggle last_step to True, which will terminate the training loop
-        # Stopping condition to respect num_iterations, if given
-        it += 1
-        if num_iterations > 0 and it >= num_iterations:
-            last_step = True # toggle last_step to True, which will terminate the training loop
-        # Build up inputs/targets and yield
-        for i in range(needed_tokens):
-            scratch[i] = token_buffer.popleft()
-        inputs_cpu = scratch[:-1].to(dtype=torch.int32)
-        targets_cpu = scratch[1:]
-        inputs = inputs_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int32, non_blocking=True)
-        targets = targets_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int64, non_blocking=True)
-        if split == "train":
-            if num_iterations > 0:
-                approx_progress = it / num_iterations # calculate progress from the max number of iterations
-            else:
-                approx_progress = cursor / dataset_size # approximate progress as a fraction of the dataset
-        yield inputs, targets
+if use_hf:
+    specs = _parse_hf_mixture(hf_mixture)
+    assert specs, "--use_hf is set but --hf_mixture is empty."
+    print0("[mid] Using HF streaming mixture:")
+    for s in specs:
+        print0(f"  - {s.name} (split={s.split}, weight={s.weight}, text_key={s.text_key}, preproc={s.preproc})")
 
-train_loader = mid_data_generator("train")
-build_val_loader = lambda: mid_data_generator("val")
+    def train_loader_gen():
+        gen = _hf_pack_generator(tokenizer, specs, device, device_batch_size, max_seq_len, hf_seed, ddp_rank)
+        for inputs, targets in gen:
+            yield inputs, targets
+
+    def val_loader_gen():
+        gen = _hf_pack_generator(tokenizer, specs, device, device_batch_size, max_seq_len, hf_seed + 123, ddp_rank)
+        for inputs, targets in gen:
+            yield inputs, targets
+
+    train_loader = train_loader_gen()
+    build_val_loader = lambda: val_loader_gen()
+
+    # stream is infinite → we stop by num_iterations
+    last_step = False
+    approx_progress = 0.0
+else:
+    identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
+    train_dataset = TaskMixture([
+        SmolTalk(split="train"), # 460K rows of general conversations
+        MMLU(subset="auxiliary_train", split="train"), # 100K rows of multiple choice problems drawn from ARC, MC_TEST, OBQA, RACE
+        GSM8K(subset="main", split="train"), # 8K rows teaching simple math and (calculator) tool use
+        CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
+        CustomJSON(filepath=identity_conversations_filepath), # let's do 2 epochs of these
+    ]) # total: 460K + 100K + 8K = 568K rows
+    val_dataset = TaskMixture([
+        SmolTalk(split="test"), # 24K rows in test set
+        MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
+        GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
+    ]) # total: 24K + 14K + 1.32K ~= 39K rows
+    # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
+    # A big problem is that we don't know the final num_iterations in advance. So we create
+    # these two global variables and update them from within the data generator.
+    last_step = False # we will toggle this to True when we reach the end of the dataset
+    approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
+    def mid_data_generator(split):
+        global last_step, approx_progress
+        assert split in {"train", "val"}, "split must be 'train' or 'val'"
+        dataset = train_dataset if split == "train" else val_dataset
+        dataset_size = len(dataset)
+        assert dataset_size > 0
+        needed_tokens = device_batch_size * max_seq_len + 1 # to form one training batch of inputs,targets
+        token_buffer = deque()
+        scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
+        cursor = ddp_rank # increments by ddp_world_size each time, so each rank processes unique documents
+        it = 0 # iteration counter
+        while True:
+            # Accumulate enough tokens for one iteration before yielding
+            while len(token_buffer) < needed_tokens:
+                conversation = dataset[cursor]
+                ids, _ = tokenizer.render_conversation(conversation)
+                token_buffer.extend(ids)
+                cursor += ddp_world_size
+                if cursor >= dataset_size:
+                    cursor -= dataset_size # wrap around for another epoch
+                    if split == "train":
+                        last_step = True # toggle last_step to True, which will terminate the training loop
+            # Stopping condition to respect num_iterations, if given
+            it += 1
+            if num_iterations > 0 and it >= num_iterations:
+                last_step = True # toggle last_step to True, which will terminate the training loop
+            # Build up inputs/targets and yield
+            for i in range(needed_tokens):
+                scratch[i] = token_buffer.popleft()
+            inputs_cpu = scratch[:-1].to(dtype=torch.int32)
+            targets_cpu = scratch[1:]
+            inputs = inputs_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int32, non_blocking=True)
+            targets = targets_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int64, non_blocking=True)
+            if split == "train":
+                if num_iterations > 0:
+                    approx_progress = it / num_iterations # calculate progress from the max number of iterations
+                else:
+                    approx_progress = cursor / dataset_size # approximate progress as a fraction of the dataset
+            yield inputs, targets
+
+    train_loader = mid_data_generator("train")
+    build_val_loader = lambda: mid_data_generator("val")
 progress = 0 # will go from 0 to 1 over the course of the epoch
 
 # Learning rate scheduler
@@ -182,6 +346,9 @@ while True:
         last_step_tensor = torch.tensor(last_step, dtype=torch.int32, device=device)
         dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
         last_step = bool(last_step_tensor.item())
+    # --- NEW: HF mode uses num_iterations to stop since stream is infinite ---
+    if use_hf and 0 < num_iterations <= step:
+        last_step = True
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if eval_every > 0 and (last_step or step % eval_every == 0):

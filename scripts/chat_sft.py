@@ -9,6 +9,16 @@ Or torchrun for training:
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 """
 
+# NEW
+
+try:
+    from datasets import load_dataset
+except Exception:
+    load_dataset = None
+
+from typing import Iterator, List
+import random
+
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -28,6 +38,70 @@ from tasks.arc import ARC
 from tasks.gsm8k import GSM8K
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
+
+# NEW: HF SFT options
+use_hf_sft = False                      # set True to read SFT from HF
+sft_repo_id = "aveekmukherjee/travel-sft-eu-india"
+sft_split = "train"                     # "train" | "validation" | "test"
+sft_seed = 42
+
+
+# --- dialog rendering & HF streaming ---
+def _render_dialog_text(dialog: list) -> str:
+    parts = []
+    for m in dialog:
+        role = m.get("role", "")
+        content = m.get("content", "")
+        if role == "system":   parts.append(f"<|system|>\n{content}\n")
+        elif role == "user":   parts.append(f"<|user|>\n{content}\n")
+        else:                  parts.append(f"<|assistant|>\n{content}\n")
+    return "".join(parts).strip()
+
+def _encode_with_nanochat(tok, text: str) -> List[int]:
+    try:
+        ids = tok(text)      # nanochat tokenizer is callable
+    except TypeError:
+        ids = tok.encode(text)
+    return ids.tolist() if torch.is_tensor(ids) else list(ids)
+
+def _hf_sft_stream(tokenizer, repo_id: str, split: str, seed: int, rank: int) -> Iterator[str]:
+    assert load_dataset is not None, "pip install datasets"
+    rnd = random.Random(seed + rank)
+    ds = load_dataset(repo_id, split=split, streaming=True)
+    it = iter(ds)
+    while True:
+        ex = next(it, None)
+        if ex is None:
+            it = iter(load_dataset(repo_id, split=split, streaming=True)); continue
+        # support both nested dialogs and string
+        dlg = ex.get("dialog")
+        if isinstance(dlg, list):
+            text = _render_dialog_text(dlg)
+        else:
+            text = str(dlg)
+        yield text
+
+def _hf_sft_pack_loader(tokenizer, repo_id: str, split: str, device, device_batch_size: int, max_seq_len: int, seed: int, rank: int):
+    text_iter = _hf_sft_stream(tokenizer, repo_id, split, seed, rank)
+    buf = []
+    batch_x, batch_y = [], []
+    eos_id = getattr(tokenizer, "eos_id", None)
+    while True:
+        txt = next(text_iter)
+        ids = _encode_with_nanochat(tokenizer, txt)
+        if eos_id is not None:
+            ids = ids + [eos_id]
+        buf.extend(ids)
+        while len(buf) >= max_seq_len + 1:
+            x = torch.tensor(buf[:max_seq_len], dtype=torch.long)
+            y = torch.tensor(buf[1:max_seq_len+1], dtype=torch.long)
+            buf = buf[max_seq_len:]
+            batch_x.append(x); batch_y.append(y)
+            if len(batch_x) == device_batch_size:
+                X = torch.stack(batch_x).to(device=device, dtype=torch.int32,  non_blocking=True)
+                Y = torch.stack(batch_y).to(device=device, dtype=torch.int64, non_blocking=True)
+                batch_x, batch_y = [], []
+                yield X, Y
 
 # -----------------------------------------------------------------------------
 # SFT Hyperparameters
@@ -136,8 +210,30 @@ if num_iterations == -1:
     # derive num_iterations from num_epochs and the size of the dataset
     assert num_epochs > 0, "num_epochs must be positive if num_iterations is -1"
     num_iterations = (len(train_ds) // target_examples_per_step) * num_epochs
-train_loader = sft_data_generator(train_ds, batch_size=device_batch_size)
-build_val_loader = lambda: sft_data_generator(val_ds, batch_size=device_batch_size)
+if use_hf_sft:
+    print0(f"[sft] Using HF dataset: {sft_repo_id} split={sft_split}")
+    def train_loader():
+        gen = _hf_sft_pack_loader(tokenizer, sft_repo_id, sft_split, device, device_batch_size, max_seq_len, sft_seed, ddp_rank)
+        for X, Y in gen:
+            yield X, Y
+
+    # Prefer 'validation' split for eval if it exists; otherwise reuse sft_split with different seed
+    def build_val_loader():
+        split = "validation"
+        try:
+            _ = load_dataset(sft_repo_id, split=split, streaming=True)
+        except Exception:
+            split = sft_split
+        def _val():
+            gen = _hf_sft_pack_loader(tokenizer, sft_repo_id, split, device, device_batch_size, max_seq_len, sft_seed + 123, ddp_rank)
+            for X, Y in gen:
+                yield X, Y
+        return _val()
+else:
+    # original
+    # (e.g., TaskMixture of SmolTalk + identity JSON; generator using tokenizer.render_conversation)
+    train_loader = sft_data_generator(train_ds, batch_size=device_batch_size)
+    build_val_loader = lambda: sft_data_generator(val_ds, batch_size=device_batch_size)
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer

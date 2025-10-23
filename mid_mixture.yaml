@@ -1,0 +1,6 @@
+mixture:
+  - {name: "aveekmukherjee/wikivoyage-eu-india-sections", weight: 0.55, text_key: text, preproc: section_header}
+  - {name: "aveekmukherjee/wikipedia-travel-eu-india",    weight: 0.30, text_key: text, preproc: section_header}
+  - {name: "aveekmukherjee/travel-mid-eu-india",          weight: 0.12, text_key: auto}
+  - {name: "your_org/gsm8k-mini",                          weight: 0.02, text_key: text}
+  - {name: "your_org/mmlu-mini",                           weight: 0.01, text_key: text}

@@ -1,0 +1,5 @@
+mixture:
+  - {name: "aveekmukherjee/wikivoyage-eu-india-sections", weight: 0.25, text_key: text, preproc: section_header}
+  - {name: "aveekmukherjee/wikipedia-travel-eu-india",    weight: 0.15, text_key: text, preproc: section_header}
+  - {name: "aveekmukherjee/travel-mid-no-tools-eu-india", weight: 0.10, text_key: auto}
+  - {name: "fineweb-edu-mini",                            weight: 0.50, text_key: text}
