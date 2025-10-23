@@ -33,6 +33,9 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 mkdir -p "$NANOCHAT_BASE_DIR"
 
+echo "[env] NANOCHAT_BASE_DIR=$NANOCHAT_BASE_DIR"
+echo "[env] HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:+set}"
+
 # venv via uv (fast)
 command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 [ -d ".venv" ] || uv venv
@@ -51,12 +54,15 @@ python -m nanochat.report reset
 
 # ---------- tokenizer (tiny) ----------
 # Rust BPE build (noop if already built)
-if ! command -v maturin &>/dev/null; then uv tool install maturin; fi
-# Build the rustbpe Tokenizer (only if no build artifacts exist)
+if ! command -v maturin &>/dev/null; then uv tool install maturin || true; fi
 if compgen -G "rustbpe/target/release/*rustbpe*" > /dev/null; then
   echo "[info] rustbpe already built."
 else
-  uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
+  if command -v maturin &>/dev/null; then
+    uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
+  else
+    uvx maturin develop --release --manifest-path rustbpe/Cargo.toml
+  fi
 fi
 
 # download only 1 shard and train a tiny tokenizer on ~200k chars
@@ -71,6 +77,50 @@ if ls "${DATA_ROOT}"/*.parquet >/dev/null 2>&1; then
     [ -f "${DATA_ROOT}/val/$(basename "$f")" ]   || cp "$f" "${DATA_ROOT}/val/"
   done
 fi
+
+# sanity: show what we have
+echo "[debug] DATA_ROOT=${DATA_ROOT}"
+echo "[debug] train files:"; ls -lh "${DATA_ROOT}/train" || true
+echo "[debug] val files:";   ls -lh "${DATA_ROOT}/val"   || true
+
+# ---- Fallback: ensure there is at least one non-empty parquet with 'text' ----
+python - <<'PY'
+import os, glob
+try:
+    import pyarrow as pa, pyarrow.parquet as pq
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyarrow>=12"])
+    import pyarrow as pa, pyarrow.parquet as pq
+
+base = os.environ.get("NANOCHAT_BASE_DIR", os.path.expanduser("~/.cache/nanochat"))
+root = os.path.join(base, "base_data")
+def rows(d):
+    files = glob.glob(os.path.join(d, "*.parquet"))
+    if not files: return 0
+    try:
+        return pq.ParquetFile(files[0]).metadata.num_rows or 0
+    except Exception:
+        return 0
+
+for split in ("train","val"):
+    d = os.path.join(root, split)
+    os.makedirs(d, exist_ok=True)
+    if rows(d) == 0:
+        # write a tiny file with a 'text' column so tok_train/tok_eval have something real
+        texts = [
+            "Travel is fun.", "Paris is lovely in spring.",
+            "Goa beaches are popular in winter.", "Berlin has great museums.",
+            "Trains connect European cities efficiently.", "Kerala monsoon is Jun–Sep.",
+            "IATA codes DEL, CDG, FRA help routing.", "UNESCO sites attract tourists."
+        ] * 64  # ~512 rows
+        pq.write_table(pa.Table.from_arrays([pa.array(texts)], names=["text"]),
+                       os.path.join(d, f"smoke_{split}.parquet"))
+        print(f"[heal] wrote smoke_{split}.parquet to {d}")
+    else:
+        print(f"[ok] {split} has rows")
+PY
+# ------------------------------------------------------------------------------
 python -m scripts.tok_train --max_chars=200000
 if ls "${DATA_ROOT}/train"/*.parquet >/dev/null 2>&1; then
   python -m scripts.tok_eval
