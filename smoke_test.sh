@@ -31,6 +31,7 @@ EVAL_TOKENS=$((SEQ_LEN * DEV_BS * 32))          # ~8k tokens for quick bpb/eval 
 # ---------- environment & deps ----------
 export OMP_NUM_THREADS=1
 export TINYCHAT_BASE_DIR="${TINYCHAT_BASE_DIR:-$HOME/.cache/tinychat}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$TINYCHAT_BASE_DIR}"
 mkdir -p "$TINYCHAT_BASE_DIR"
 
 # venv via uv (fast)
@@ -51,12 +52,18 @@ python -m nanochat.report reset
 
 # ---------- tokenizer (tiny) ----------
 # Rust BPE build (noop if already built)
-if ! command -v maturin &>/dev/null; then uv tool install maturin; fi
+# Ensure maturin is available
+if ! command -v maturin &>/dev/null; then uv tool install maturin || true; fi
 # Build the rustbpe Tokenizer (only if no build artifacts exist)
 if compgen -G "rustbpe/target/release/*rustbpe*" > /dev/null; then
   echo "[info] rustbpe already built."
 else
-  uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
+  # fall back to uvx if maturin isn't on PATH
+  if command -v maturin &>/dev/null; then
+    uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
+  else
+    uvx maturin develop --release --manifest-path rustbpe/Cargo.toml
+  fi
 fi
 
 # download only 1 shard and train a tiny tokenizer on ~200k chars
