@@ -2,7 +2,7 @@
 """
 Train model. Run as:
 
-python scripts/base_train.py
+python scripts/base_train2.py
 
 Distributed:
 torchrun --nproc_per_node=8 scripts/base_train.py
@@ -14,7 +14,7 @@ New flags in this edition:
   --use_hf                # stream data from Hugging Face mixtures (see --hf_mixture)
   --hf_mixture MIX        # YAML string OR path describing HF datasets+weights
 """
-
+import sys
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -123,7 +123,12 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 orig_model = model
-model = torch.compile(model, dynamic=False)
+use_compile = (device_type == "cuda") and os.environ.get("TORCH_COMPILE_DISABLE", "0") != "1"
+if use_compile: # we run this on cuda only
+    try:
+        model = torch.compile(model, dynamic=False)
+    except Exception as e:
+        print0(f"[warn] torch.compile disabled (reason: {e})")
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -262,8 +267,15 @@ def pack_tokens(text_iter: Iterator[str], seq_len: int) -> Iterator[Dict[str, to
     buf: List[int] = []
     for txt in text_iter:
         ids = _encode_with_nanochat(tokenizer, txt)
-        buf.extend(ids + [_encode_with_nanochat(tokenizer, "<|eot|>")[-1] if "<|eot|>" in str(tokenizer) else tokenizer.eos_id]) \
-            if hasattr(tokenizer, "eos_id") else buf.extend(ids)
+        if hasattr(tokenizer, "eos_id"):
+            # prefer <|eot|> if your tokenizer has it, else fall back to eos_id
+            if "<|eot|>" in getattr(tokenizer, "special_tokens", []) or "<|eot|>" in str(tokenizer):
+                eot = _encode_with_nanochat(tokenizer, "<|eot|>")[-1]
+                buf.extend(ids + [eot])
+            else:
+                buf.extend(ids + [tokenizer.eos_id])
+        else:
+            buf.extend(ids)
         while len(buf) >= seq_len + 1:
             x = torch.tensor(buf[:seq_len], dtype=torch.long)
             y = torch.tensor(buf[1:seq_len+1], dtype=torch.long)

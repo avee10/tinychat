@@ -22,7 +22,18 @@ split_tokens = 20*524288  # number of tokens to evaluate per split
 model_tag = None # optional model tag for the output directory name
 model_step = None # optional model step for the output directory name
 device_type = "" # cuda|cpu|mps (empty => autodetect)
+
+max_seq_len = None   # optional legacy alias (ignored by base_loss)
+eval_tokens = None   # optional legacy alias; if set, we map to split_tokens
+
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
+
+if eval_tokens is not None:
+    split_tokens = eval_tokens
+    print0(f"[alias] Using eval_tokens -> split_tokens = {split_tokens}")
+if max_seq_len is not None:
+    print0("[alias] max_seq_len was provided but base_loss ignores it; "
+           "sequence_len is taken from the loaded checkpoint.")
 
 # Load the base model and the tokenizer
 device_type = autodetect_device_type() if device_type == "" else device_type

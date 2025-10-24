@@ -8,7 +8,7 @@ from pathlib import Path
 
 # ---------- config ----------
 RANDOM_SEED = 7
-MID_OUT = Path("../midtrain/out"); SFT_OUT = Path("../sft/out")
+MID_OUT = Path("out"); SFT_OUT = Path("../sft/out")
 MID_OUT.mkdir(parents=True, exist_ok=True); SFT_OUT.mkdir(parents=True, exist_ok=True)
 
 # Point to your private datasets (EU + India)
