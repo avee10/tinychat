@@ -262,7 +262,7 @@ def get_lr_multiplier(it):
 
 # Go!
 step = 0
-train_iter = iter(train_loader)
+train_iter = iter(train_loader() if callable(train_loader) else train_loader)
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
 
