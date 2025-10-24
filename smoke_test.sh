@@ -78,8 +78,8 @@ else
   uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 fi
 
-# Tokenizer training data: Grab 3 shards of base data (has a 'text' column), 1 will be used for eval, 2 for training the tokenizer
-python -m nanochat.dataset -n 3
+# Tokenizer training data: Grab 8 shards of base data (has a 'text' column), 5 will be used for eval, 3 for training the tokenizer
+python -m nanochat.dataset -n 8
 DATA_ROOT="${NANOCHAT_BASE_DIR}/base_data"
 
 echo "[debug] DATA_ROOT=${DATA_ROOT}"
@@ -127,6 +127,9 @@ if [[ "${USE_HF_MID}" == "1" ]]; then
 YAML
   MID_FLAGS="--use_hf=1 --hf_mixture $NANOCHAT_BASE_DIR/mid_mixture.yaml"
 fi
+
+# synthetic data
+curl -L -o $NANOCHAT_BASE_DIR/travel_mid_conversations.jsonl https://huggingface.co/datasets/aveekmukherjee/travel-mid-conversations
 
 torchrun --standalone --nproc_per_node=1 -m scripts.mid_train -- \
   --device_batch_size $DEV_BS \

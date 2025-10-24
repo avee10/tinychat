@@ -60,7 +60,7 @@ uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 # each data shard is ~250M chars
 # so we download 2e9 / 250e6 = 8 data shards at this point
 # each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-python -m nanochat.dataset -n 1
+python -m nanochat.dataset -n 3
 # Immediately also kick off downloading more shards in the background while tokenizer trains
 # See comment below for why 240 is the right number here
 #python -m nanochat.dataset -n 240 &
@@ -103,7 +103,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_eval
 
 # download 2.3MB of synthetic identity conversations to impart a personality to nanochat
 # see dev/gen_sft_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
-curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+curl -L -o $NANOCHAT_BASE_DIR/travel_mid_conversations.jsonl https://huggingface.co/datasets/aveekmukherjee/travel-mid-conversations
 
 # run midtraining and eval the model
 torchrun --standalone --nproc_per_node=1 -m scripts.mid_train -- --run=$WANDB_RUN

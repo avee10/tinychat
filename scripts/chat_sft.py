@@ -147,19 +147,21 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sf
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model(source, device, phase="train", model_tag=model_tag, step=step)
+sequence_len = meta["model_config"]["sequence_len"]
+max_seq_len = sequence_len
 orig_model = model # original, uncompiled model
 # model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
-identity_conversations_filepath = os.path.join(get_base_dir(), "identity_conversations.jsonl")
+travel_conversations_filepath = os.path.join(get_base_dir(), "travel_mid_conversations.jsonl")
 train_ds = TaskMixture([
     ARC(subset="ARC-Easy", split="train"), # 2.3K rows
     ARC(subset="ARC-Challenge", split="train"), # 1.1K rows
     GSM8K(subset="main", split="train"), # 8K rows
     SmolTalk(split="train", stop=10_000), # 10K rows of smoltalk
-    CustomJSON(filepath=identity_conversations_filepath), # 1K rows of synthetic identity conversations
+    CustomJSON(filepath=travel_conversations_filepath), # 1K rows of synthetic identity conversations
 ]) # 2.3K + 1.1K + 8K + 10K + 1K = 22.4K rows
 val_ds = SmolTalk(split="test") # general conversations, 24K rows (though we don't actually use all of it)
 

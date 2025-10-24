@@ -26,7 +26,7 @@ if [ ! -d "$NANOCHAT_BASE_DIR/eval_bundle" ]; then
     rm eval_bundle.zip
     mv eval_bundle $NANOCHAT_BASE_DIR
 fi
-curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+curl -L -o $NANOCHAT_BASE_DIR/travel_mid_conversations.jsonl https://huggingface.co/datasets/aveekmukherjee/travel-mid-conversations
 
 # train tokenizer on ~4B characters and kick off download of the rest for pretraining
 python -m nanochat.dataset -n 16
