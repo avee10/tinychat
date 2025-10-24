@@ -4,3 +4,5 @@ __pycache__/
 rustbpe/target/
 dev-ignore/
 report.md
+uv.lock
+Cargo.lock
