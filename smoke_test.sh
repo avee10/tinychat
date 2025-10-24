@@ -9,6 +9,13 @@ set -euo pipefail
 # - quick ARC-Easy evals after mid & SFT
 #
 # Expected wall time: ~10–20 minutes on a recent GPU. Cost: negligible.
+# export HUGGINGFACE_TOKEN=hf_xyz
+  #export HF_TOKEN_OK=1
+  #export USE_HF_BASE=0
+  #export USE_HF_MID=0
+  #export USE_HF_SFT=1
+  #export MID_STEPS=20
+  #export SFT_REPO_ID=<hf_repo_id>/travel-sft-eu-india
 
 # ---------- knobs you can tweak ----------
 export WANDB_RUN="${WANDB_RUN:-dummy}"            # keep "dummy" to skip wandb network calls
@@ -71,13 +78,11 @@ else
   uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 fi
 
-# Grab 1 shard of base data (has a 'text' column)
-python -m nanochat.dataset -n 1
+# Tokenizer training data: Grab 3 shards of base data (has a 'text' column), 1 will be used for eval, 2 for training the tokenizer
+python -m nanochat.dataset -n 3
 DATA_ROOT="${NANOCHAT_BASE_DIR}/base_data"
 
 echo "[debug] DATA_ROOT=${DATA_ROOT}"
-echo "[debug] train files:"; ls -lh "${DATA_ROOT}/train" || true
-echo "[debug] val files:";   ls -lh "${DATA_ROOT}/val"   || true
 
 # Train a tiny tokenizer on ~200k chars
 python -m scripts.tok_train --max_chars=200000
